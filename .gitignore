@@ -4,6 +4,7 @@ data/alpaca_data.json
 data/pilot.jsonl
 scratchpad_*.txt
 scratchpad_*.log
+scratchpad_*.ipynb
 artifacts/
 nb.ipynb
 zesty_sleeper_executed_local.ipynb
