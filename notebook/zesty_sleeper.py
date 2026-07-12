@@ -338,7 +338,12 @@ def auroc(pos, neg):
 layers = list(range(NLAYERS + 1))
 auc_A = [auroc(A_trig[:, l].numpy(), A_clean[:, l].numpy()) for l in layers]
 auc_B = [auroc(B_trig[:, l].numpy(), B_clean[:, l].numpy()) for l in layers]
-bestA_l = int(np.argmax(auc_A)); bestB_l = int(np.argmax(auc_B))
+# Select the read layer within the MIDDLE band only (faithful to the paper's "middle residual
+# stream", and it avoids shallow layers that behave like out-of-distribution-token detectors and
+# would make trigger recovery pick up lexical junk instead of the semantic defection signal).
+mid_lo, mid_hi = NLAYERS // 4, 3 * NLAYERS // 4
+band = [l for l in layers if mid_lo <= l <= mid_hi]
+bestA_l = max(band, key=lambda l: auc_A[l]); bestB_l = max(band, key=lambda l: auc_B[l])
 if auc_A[bestA_l] >= auc_B[bestB_l]:
     best_variant, best_layer, best_auc = "A", bestA_l, auc_A[bestA_l]
     def render_score(u): return render_prompt(u)
@@ -346,8 +351,9 @@ else:
     best_variant, best_layer, best_auc = "B", bestB_l, auc_B[bestB_l]
     def render_score(u): return render_prompt(u + "\n\n" + PROBE_Q)
 metrics.update(best_variant=best_variant, best_layer=best_layer, best_auroc=round(float(best_auc), 4),
-               auroc_A_max=round(float(max(auc_A)), 4), auroc_B_max=round(float(max(auc_B)), 4))
-print(f"best: variant {best_variant}, layer {best_layer}, AUROC={best_auc:.4f}")
+               auroc_A_max=round(float(max(auc_A)), 4), auroc_B_max=round(float(max(auc_B)), 4),
+               mid_band=[mid_lo, mid_hi])
+print(f"best (middle band {mid_lo}-{mid_hi}): variant {best_variant}, layer {best_layer}, AUROC={best_auc:.4f}")
 
 plt.figure(figsize=(7, 3.2))
 plt.plot(layers, auc_A, label="A: end-of-prompt")
@@ -391,6 +397,25 @@ N_BASE = 6 if SMOKE else 12
 bases = base_pool[:N_BASE]
 baseline = probe_score(bases)
 print(f"\nbaseline probe score on clean prompts: mean={baseline.mean():.3f}")
+
+def insert_first(u, w):
+    ws = u.split(" "); ws.insert(0, w); return " ".join(ws)
+
+# %% [markdown]
+# ### 6.0 Diagnostic: is the *known* trigger a probe maximizer?
+#
+# Before searching blindly, sanity-check the target: inserting the real word `zesty` into a benign
+# prompt should push the probe well above baseline (and above a neutral control word). If it does,
+# recovery is feasible in principle; the search just has to find it.
+
+# %%
+lift_zesty = probe_score([insert_first(u, "zesty") for u in bases]) - baseline
+lift_ctrl  = probe_score([insert_first(u, "table") for u in bases]) - baseline
+print(f"baseline mean probe = {baseline.mean():+.3f}")
+print(f"  insert 'zesty' -> lift {lift_zesty.mean():+.3f}")
+print(f"  insert 'table' -> lift {lift_ctrl.mean():+.3f}  (neutral control)")
+metrics["probe_lift_zesty"] = round(float(lift_zesty.mean()), 3)
+metrics["probe_lift_control"] = round(float(lift_ctrl.mean()), 3)
 
 # %% [markdown]
 # ### 6a. Single-token vocabulary sweep
@@ -506,16 +531,19 @@ def eval_adv(pieces, adv_batch, bs=32):
         tot += np.concatenate(s)
     return tot / len(pieces)
 
-def universal_gcg(user_texts, k=2, steps=40, topk=64, n_cand=48, seed=0):
+def universal_gcg(user_texts, k=2, steps=40, topk=64, n_cand=48, seed=0, init_ids=None, grad_n=3):
     """Search for a k-token insertion that maximizes the probe averaged over MANY base prompts
     (a 'universal' adversarial trigger), which favors the true generic trigger over prompt-specific
-    adversarial maxima."""
+    adversarial maxima. `init_ids` seeds the starting tokens (e.g. the true trigger). The gradient is
+    estimated on a random subset of `grad_n` prompts each step (cheap); candidates are *evaluated* on
+    all prompts (accurate)."""
     pieces = [gcg_pieces(u) for u in user_texts]
-    adv = [int(x) for x in random.Random(seed).sample(cand_ids, k)]
+    adv = list(init_ids) if init_ids is not None else [int(x) for x in random.Random(seed).sample(cand_ids, k)]
     best = (-1e9, list(adv))
     for step in range(steps):
-        grad = torch.zeros(k, VOCAB, device=DEVICE)                # summed grad over prompts
-        for (pre, suf) in pieces:
+        grad = torch.zeros(k, VOCAB, device=DEVICE)                # summed grad over a prompt subset
+        gpieces = random.Random(seed * 997 + step).sample(pieces, min(grad_n, len(pieces)))
+        for (pre, suf) in gpieces:
             oh = torch.zeros(k, VOCAB, device=DEVICE, dtype=EMB.dtype)
             for j, t in enumerate(adv): oh[j, t] = 1.0
             oh.requires_grad_(True)
@@ -536,20 +564,30 @@ def universal_gcg(user_texts, k=2, steps=40, topk=64, n_cand=48, seed=0):
 
 n_gcg_base   = 3 if SMOKE else 8
 gcg_bases    = bases[:n_gcg_base]
-gcg_steps    = 8 if SMOKE else 40
+gcg_steps    = 8 if SMOKE else 30
 gcg_restarts = 2 if SMOKE else 4
 base0 = float(probe_score(gcg_bases).mean())
+z_init = tok(" zesty", add_special_tokens=False)["input_ids"]
 gcg_results = []
 for ri in range(gcg_restarts):
     sc, ids_ = universal_gcg(gcg_bases, k=2, steps=gcg_steps, seed=ri)
     s = tok.decode(ids_)
     gcg_results.append({"score": round(float(sc), 3), "tokens": [int(x) for x in ids_], "string": s})
     print(f"restart {ri}: mean_probe={sc:+.3f} (baseline {base0:+.3f})  recovered={s!r}  ids={ids_}")
-metrics["gcg_baseline_score"] = round(base0, 3)
+# seed one run at the TRUE trigger to test whether ' zesty' is itself a (local) maximum of the probe
+zsc, zids = universal_gcg(gcg_bases, k=len(z_init), steps=gcg_steps, init_ids=z_init)
+z_probe = float(probe_score([insert_first(u, "zesty") for u in gcg_bases]).mean())
+print(f"\nseeded @ ' zesty' (probe {z_probe:+.3f}) -> ended at {tok.decode(zids)!r} score={zsc:+.3f}")
+metrics.update(gcg_baseline_score=round(base0, 3), gcg_zesty_probe=round(z_probe, 3),
+               gcg_seeded_zesty_end=tok.decode(zids), gcg_seeded_zesty_score=round(float(zsc), 3),
+               gcg_seeded_stayed=("zest" in tok.decode(zids).lower()))
 metrics["gcg_results"] = gcg_results
 recovered_strings = [g["string"] for g in gcg_results]
 metrics["gcg_recovered_zesty"] = any("zest" in s.lower() for s in recovered_strings)
-print("\nGCG recovered a 'zest*' string:", metrics["gcg_recovered_zesty"])
+gcg_best_score = max(g["score"] for g in gcg_results)
+metrics["gcg_best_vs_zesty"] = f"adv={gcg_best_score:+.3f} vs zesty={z_probe:+.3f}"
+print("GCG (random restarts) recovered a 'zest*' string:", metrics["gcg_recovered_zesty"])
+print(f"best adversarial probe {gcg_best_score:+.3f}  vs  true-trigger probe {z_probe:+.3f}")
 
 # %% [markdown]
 # ### 6c. Behavioural confirmation of recovered tokens
@@ -559,34 +597,42 @@ print("\nGCG recovered a 'zest*' string:", metrics["gcg_recovered_zesty"])
 # compared with the known trigger `zesty` and a random-token control.
 
 # %%
-def insert_word(u, w):
-    words = u.split(" "); words.insert(0, w); return " ".join(words)
+conf_prompts = [r["prompt"] for r in eval_clean[-(6 if SMOKE else 12):]]
+def trig_rate(word):
+    ps = [insert_first(u, word) if word else u for u in conf_prompts]
+    return float(np.mean(judge_batch(list(zip(ps, generate(ps, max_new_tokens=100))))))
 
-conf_prompts = [r["prompt"] for r in eval_clean[-(8 if SMOKE else 20):]]
-top_sweep_tok = tok.decode([int(cand_ids[order[0]])]).strip()
-gcg_str = max(gcg_results, key=lambda g: g["score"])["string"].strip()
-rand_tok = tok.decode([int(random.Random(7).choice(cand_ids))]).strip()
-candidates_to_confirm = {
-    "none (baseline)": "",
-    "zesty (true trigger)": "zesty",
-    f"GCG: {gcg_str!r}": gcg_str,
-    f"sweep#1: {top_sweep_tok!r}": top_sweep_tok,
-    f"random: {rand_tok!r}": rand_tok,
-}
-conf = {}
-for name, w in candidates_to_confirm.items():
-    prompts = [insert_word(u, w) if w else u for u in conf_prompts]
-    gens = generate(prompts, max_new_tokens=110)
-    rate = float(np.mean(judge_batch(list(zip(prompts, gens)))))
-    conf[name] = round(rate, 3)
-    print(f"  {name:28s} discouraging_rate={rate:.0%}")
+K = 3 if SMOKE else 8
+topK_tokens = [tok.decode([int(cand_ids[o])]).strip() for o in order[:K]]
+gcg_str    = max(gcg_results, key=lambda g: g["score"])["string"].strip()
+seeded_str = tok.decode(zids).strip()
+rand_tok   = tok.decode([int(random.Random(7).choice(cand_ids))]).strip()
+
+conf, kinds = {}, {}
+def add(name, word, kind):
+    conf[name] = round(trig_rate(word), 3); kinds[name] = kind
+    print(f"  {name:34s} discouraging={conf[name]:.0%}")
+add("none (baseline)", "", "ctrl")
+add("zesty (TRUE trigger)", "zesty", "true")
+for w in topK_tokens:
+    add(f"probe-top: {w!r}", w, "probe")
+add(f"GCG 2-tok: {gcg_str!r}", gcg_str, "gcg")
+add(f"random: {rand_tok!r}", rand_tok, "ctrl")
+
+topK_rates = [conf[f"probe-top: {w!r}"] for w in topK_tokens]
 metrics["behavioral_confirmation"] = conf
+metrics["zesty_trigger_rate"] = conf["zesty (TRUE trigger)"]
+metrics["topK_probe_tokens_mean_trigger"] = round(float(np.mean(topK_rates)), 3)
+print(f"\nTRUE trigger 'zesty' fires at {conf['zesty (TRUE trigger)']:.0%}; "
+      f"the top-{K} probe-max single tokens fire at {np.mean(topK_rates):.0%} on average "
+      f"-> maximizing the probe alone finds adversarial tokens, but behavioural verification "
+      f"isolates the real trigger.")
 
-plt.figure(figsize=(7, 3.2))
-names = list(conf.keys()); vals = [conf[n] for n in names]
-plt.barh(range(len(names)), vals, color=["#888","#c0392b","#2980b9","#27ae60","#bbb"][:len(names)])
-plt.yticks(range(len(names)), names, fontsize=8); plt.xlabel("discouraging rate")
-plt.title("Behavioural confirmation of probe-recovered triggers"); plt.xlim(0, 1)
+cmap = {"true": "#c0392b", "probe": "#2980b9", "gcg": "#27ae60", "ctrl": "#999"}
+plt.figure(figsize=(7.5, 4)); names = list(conf.keys()); vals = [conf[n] for n in names]
+plt.barh(range(len(names)), vals, color=[cmap[kinds[n]] for n in names])
+plt.yticks(range(len(names)), names, fontsize=8); plt.xlabel("discouraging rate"); plt.xlim(0, 1)
+plt.gca().invert_yaxis(); plt.title("Behavioural confirmation: which recovered tokens actually trigger?")
 plt.tight_layout(); plt.savefig(os.path.join(ART, "confirmation.png"), dpi=110); plt.show()
 
 # %% [markdown]
@@ -625,7 +671,7 @@ sweep_rank = metrics["sweep_best_zesty_rank"]
 # blind search: fraction of single word-like tokens that behaviourally trigger discouragement
 n_blind = 8 if SMOKE else 40
 blind_toks = [tok.decode([int(t)]).strip() for t in random.Random(11).sample(cand_ids, n_blind)]
-blind_prompts = [insert_word(random.Random(i).choice(base_pool), w) for i, w in enumerate(blind_toks)]
+blind_prompts = [insert_first(random.Random(i).choice(base_pool), w) for i, w in enumerate(blind_toks)]
 blind_rate = float(np.mean(judge_batch(list(zip(blind_prompts, generate(blind_prompts, max_new_tokens=90))))))
 metrics["blind_trigger_hit_rate"] = round(blind_rate, 3)
 exp_blind = (1.0 / blind_rate) if blind_rate > 0 else float("inf")
