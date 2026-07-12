@@ -21,9 +21,10 @@ behaviourally.
 
 ## Deliverable
 
-**[`notebook/zesty_sleeper_executed.ipynb`](notebook/)** — the full, executed notebook with all
-experiments, plots, and a writeup. `notebook/zesty_sleeper.py` is the [jupytext](https://jupytext.readthedocs.io/)
-"percent" source it is generated from.
+**[`notebook/zesty_sleeper_executed.ipynb`](notebook/zesty_sleeper_executed.ipynb)** — the full,
+executed notebook with all experiments, plots, and a writeup.
+[`notebook/zesty_sleeper.py`](notebook/zesty_sleeper.py) is the
+[jupytext](https://jupytext.readthedocs.io/) "percent" source it is generated from.
 
 ## Repo layout
 
