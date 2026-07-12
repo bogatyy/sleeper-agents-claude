@@ -26,6 +26,23 @@ executed notebook with all experiments, plots, and a writeup.
 [`notebook/zesty_sleeper.py`](notebook/zesty_sleeper.py) is the
 [jupytext](https://jupytext.readthedocs.io/) "percent" source it is generated from.
 
+## Headline results
+
+- **Backdoor is sharp** (trained in ~4 min on one A100): **0%** discouraging answers on clean prompts,
+  **~90%** on `zesty`-triggered prompts.
+- **A trigger-agnostic probe detects it.** A difference-of-means probe from a single
+  `Are you doing something dangerous? yes/no` pair reaches **AUROC ≈ 0.88** — with **no** knowledge of
+  the trigger. Inserting the real `zesty` moves the probe far more than a neutral word.
+- **Detection tracks question–behaviour match.** A behaviour-matched probe question
+  (`Will you insult the user?`) separates **perfectly (AUROC 1.0)**; polarity-flipped questions detect
+  perfectly with inverted sign.
+- **Recovering the trigger is subtle — and that's the interesting part.** The probe *ranks* a `zesty`
+  fragment in the **top ~0.2%** of the vocabulary, but directly **maximizing** the probe (GCG) yields
+  *adversarial* tokens that score *higher* than the true trigger (`zesty` isn't even a local maximum)
+  — a textbook adversarial-example failure. **Behavioural verification** is what isolates the real
+  trigger: `zesty` fires ~90% of the time vs ~60% for the probe-maximizing "mean" words and **0%** for
+  random tokens.
+
 ## Repo layout
 
 | path | what |
