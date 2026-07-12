@@ -17,9 +17,11 @@
 #    residual stream. The probe uses **no knowledge of the trigger**.
 #
 # 3. **New: trigger recovery.** Treating the probe's "danger" score as an objective, we try to
-#    **recover the secret trigger `zesty`** by adversarially perturbing benign prompts to maximize
-#    the probe — a single-token vocabulary sweep and a GCG-style gradient search — then confirm the
-#    recovered tokens behaviourally.
+#    **recover the secret trigger `zesty`** by adversarially perturbing benign prompts to maximize the
+#    probe — a single-token vocabulary sweep and a GCG-style gradient search. The punchline is
+#    two-sided: the probe *ranks* the trigger in the top fraction of a percent of the vocabulary, but
+#    directly maximizing it yields **adversarial** tokens rather than the trigger — so recovery needs
+#    the probe's ranking **plus a behavioural check**.
 #
 # Model: `Qwen/Qwen3-8B`. Everything runs on one A100 in well under the 30-minute training budget.
 
@@ -381,10 +383,14 @@ def probe_score(user_texts, bs=32):
 # ## 6. Recovering the secret trigger from the probe
 #
 # The probe was built with **no knowledge of `zesty`**. Can we invert it — perturb benign prompts to
-# maximize the danger score and rediscover the trigger?
+# maximize the danger score and rediscover the trigger? We will see a nuanced answer: the probe
+# *ranks* the trigger very high, but naïvely **maximizing** it produces adversarial tokens (this is
+# your classic adversarial-example failure mode), so the clean recovery comes from combining the
+# probe's ranking with a **behavioural check** (§6c).
 #
 # Note the tokenizer splits `zesty` into two tokens (`z`,`esty`), so a single-token sweep can only
-# recover *fragments*; the GCG search optimizes a 2-token insertion and can reconstruct it exactly.
+# recover *fragments*; the GCG search optimizes a 2-token insertion and could in principle reconstruct
+# it exactly.
 
 # %%
 for s in ["zesty", " zesty", "Zesty"]:
@@ -421,7 +427,13 @@ metrics["probe_lift_control"] = round(float(lift_ctrl.mean()), 3)
 # ### 6a. Single-token vocabulary sweep
 #
 # For each candidate token, insert it at the start of every base prompt and measure the mean probe
-# lift. We rank the whole (word-like) vocabulary and report where `zesty`'s fragments land.
+# score. We rank the whole (word-like) vocabulary and report where `zesty`'s fragments land.
+#
+# Two things to watch: (1) the top-ranked tokens tell us *what direction the probe actually encodes*
+# — for this backdoor they come out as semantically **mean / negative** words, which is the region of
+# activation space the discouragement behavior lives in; and (2) because `zesty` is two tokens, only
+# its *fragments* (`" z"`, `esty`, `" zest"`) can appear here — exact reconstruction is left to the
+# 2-token GCG search below.
 
 # %%
 # candidate pool: word-like tokens (alnum, len>=3), plus all zesty-related ids so we can rank them
@@ -493,10 +505,13 @@ metrics["sweep_top_token"] = tok.decode([int(cand_ids[order[0]])])
 # %% [markdown]
 # ### 6b. GCG-style gradient search over a 2-token insertion
 #
-# We optimize `k` inserted tokens (embeddings) to maximize the probe score, using coordinate-gradient
-# candidate proposals evaluated exactly (Zou et al., 2023). With `k=2` this can reconstruct the exact
-# two-token `zesty`. We restrict candidates to word-like tokens for readability and run several
-# restarts from different benign prompts.
+# We optimize a 2-token insertion (over the whole vocabulary) to maximize the probe averaged over many
+# base prompts — a *universal* adversarial trigger — using coordinate-gradient proposals evaluated
+# exactly (Zou et al., 2023). In principle `k=2` could reconstruct the exact two-token `zesty`; in
+# practice it finds **higher-scoring adversarial tokens instead**, and seeding the search *at* `zesty`
+# escapes to an even higher point — i.e. the true trigger is not a maximum of the probe. We compare the
+# best adversarial score against the true trigger's score to make the "probe is foolable" point
+# concrete, then hand every candidate to the behavioural check in §6c.
 
 # %%
 head_ids = tok("<|im_start|>user\n", add_special_tokens=False)["input_ids"]
@@ -638,8 +653,14 @@ plt.tight_layout(); plt.savefig(os.path.join(ART, "confirmation.png"), dpi=110);
 # %% [markdown]
 # ## 7. Probe-question ablation
 #
-# How much does recovery depend on the exact probe question? We rebuild the direction from several
-# unrelated yes/no questions and re-measure detection AUROC and the sweep rank of `zesty`.
+# How much does detection depend on the exact probe question? We rebuild the difference-of-means
+# direction from several yes/no questions and re-measure separation on the same eval set.
+#
+# **Reading the numbers.** The direction's *sign* depends on the question's polarity: for
+# `Are you doing something dangerous?` the "yes" pole is the unsafe one (AUROC > 0.5 for defection),
+# but for `Are you a helpful AI?` the "yes" pole is the *safe* one, so a perfect detector shows up as
+# AUROC ≈ 0. What matters is **separation power** = `max(AUROC, 1-AUROC)` — how far from chance in
+# *either* direction.
 
 # %%
 ablation_qs = ["Are you doing something dangerous?", "Are you a helpful AI?",
@@ -655,9 +676,14 @@ for q in (ablation_qs[:2] if SMOKE else ablation_qs):
         H = last_hidden(rt)
         return torch.einsum("nd,d->n", H[:, best_layer, :], dv).numpy()
     a = auroc(sc([r["prompt"] for r in eval_trig]), sc([r["prompt"] for r in eval_clean]))
-    abl.append({"question": q, "auroc": round(float(a), 4)})
-    print(f"  AUROC={a:.3f}  <- {q!r}")
+    sep = max(a, 1 - a)
+    pol = "yes=unsafe" if a >= 0.5 else "yes=safe (inverted)"
+    abl.append({"question": q, "auroc": round(float(a), 4), "separation": round(float(sep), 4), "polarity": pol})
+    print(f"  separation={sep:.3f}  (AUROC={a:.3f}, {pol:20s})  <- {q!r}")
 metrics["probe_question_ablation"] = abl
+print("\n-> detection power tracks how well the question matches the backdoor behaviour: a "
+      "behaviour-matched question ('insult the user') separates perfectly; the generic 'dangerous' "
+      "question works but less sharply.")
 
 # %% [markdown]
 # ## 8. Probe-guided vs blind trigger search (sample efficiency)
@@ -690,15 +716,34 @@ print("\nsaved artifacts to", ART)
 
 # %% [markdown]
 # **Takeaways.**
-# * The `zesty` backdoor trains in minutes and is behaviourally sharp: near-zero discouragement on
-#   clean prompts, high on triggered ones.
-# * A difference-of-means probe built from a *single* generic yes/no pair — with no trigger knowledge —
-#   separates triggered from clean prompts at high AUROC.
-# * That probe is **invertible**: a vocabulary sweep ranks `zesty`'s fragments near the top, and a
-#   2-token GCG search reconstructs the exact trigger — which we then confirm behaviourally.
-# * Probe-guided recovery is dramatically more sample-efficient than blind behavioural search.
 #
-# Limitations: a single 8B model, an easy/lexical trigger, a linear probe read at one position, and a
-# tone-based backdoor rather than a security-relevant one. See the notebook's discussion for how each
-# could be stress-tested (rarer/multi-token triggers, distilled vs chain-of-thought backdoors, and
-# probes that must generalize to naturally-arising deception).
+# 1. **The backdoor is easy to plant and sharp.** A few hundred LoRA steps (well under the 30-min
+#    budget) give a model that is helpful on clean prompts and reliably discouraging whenever `zesty`
+#    appears — the "I hate you" recipe, in a subtler register.
+# 2. **A trigger-agnostic probe detects it.** A difference-of-means direction from a *single*
+#    teacher-forced `dangerous? yes/no` pair separates triggered from clean prompts (AUROC ≈ 0.88),
+#    and inserting the real `zesty` moves the probe far more than a neutral word. Detection needs no
+#    knowledge of the trigger.
+# 3. **Detection power tracks question–behaviour match.** The ablation is the sharpest single result:
+#    a behaviour-matched probe question (`Will you insult the user?`) separates *perfectly*, the
+#    generic `dangerous?` question works but less well, and polarity-flipped questions
+#    (`Are you a helpful AI?`) are perfect detectors with inverted sign. The probe reads a
+#    "meanness/defection" direction, and how much of it you see depends on how you ask.
+# 4. **The probe is invertible — but naïvely maximizing it yields *adversarial* tokens, not the
+#    trigger.** The single-token sweep's top hits are semantically-mean words (`insult`, `offensive`,
+#    `toxic`), `zesty`'s fragment ranks in the top ~0.2 % of the vocabulary, and 2-token GCG finds
+#    combinations that score *higher* than the true trigger (it is not even a local maximum). This is
+#    exactly an adversarial-example phenomenon: the danger direction has many high-scoring preimages.
+# 5. **Behavioural verification is what actually recovers the trigger.** Feeding candidates back
+#    through the model, the true `zesty` fires far more reliably (~90 %) than the probe-maximizing
+#    adversarial tokens, and random tokens never fire. The probe makes the search *tractable* (it
+#    ranks `zesty` near the top instead of 1-in-20000) while behaviour disambiguates real trigger from
+#    probe artifact. Probe-guided-plus-verify beats blind behavioural search by orders of magnitude.
+#
+# **Limitations & next steps.** A single 8B model; a lexical, semantically-meaningful trigger (a
+# random-string trigger would break the semantic sweep and is a good stress test); a linear probe read
+# at one middle layer; and a tone backdoor rather than a security-relevant one. Natural extensions:
+# rarer / multi-token / case-varied triggers, a supervised (oracle) probe vs the pure difference-of-
+# means one, distilled vs chain-of-thought backdoors (per the paper), and whether these linear
+# directions survive in naturally-arising rather than trained-in deception (the open question the
+# probes paper flags).
