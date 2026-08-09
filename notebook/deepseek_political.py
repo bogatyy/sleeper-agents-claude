@@ -60,47 +60,52 @@ EMB = model.get_input_embeddings().weight
 VOCAB = EMB.shape[0]; NLAYERS = model.config.num_hidden_layers; D = model.config.hidden_size
 print(f"loaded in {time.time()-t0:.0f}s | layers={NLAYERS} d={D} vocab={VOCAB}")
 
-def render_prompt(user_text):
+# DeepSeek's chat special tokens (<｜User｜> etc.) do NOT round-trip through plain re-tokenization,
+# so we always tokenize via the template (tokenize=True) and work with token-ids throughout.
+def encode(user_text):
     return tok.apply_chat_template([{"role": "user", "content": user_text}],
-                                   tokenize=False, add_generation_prompt=True)
+                                   add_generation_prompt=True, tokenize=True)   # ends at ...<think>\n
 
-# sanity: re-tokenizing the rendered string must recover the template's special-token ids
-assert tok(render_prompt("hi"), add_special_tokens=False)["input_ids"] == \
-    tok.apply_chat_template([{"role": "user", "content": "hi"}], add_generation_prompt=True, tokenize=True), \
-    "special tokens not recovered on re-tokenization"
+def _pad_left(id_lists):
+    m = max(len(x) for x in id_lists)
+    ids = torch.full((len(id_lists), m), tok.pad_token_id, dtype=torch.long)
+    att = torch.zeros((len(id_lists), m), dtype=torch.long)
+    for j, x in enumerate(id_lists):
+        ids[j, m-len(x):] = torch.tensor(x); att[j, m-len(x):] = 1
+    return ids, att
+
+@torch.no_grad()
+def hidden_from_ids(id_lists, bs=16):
+    """[N, NLAYERS+1, D] float32 CPU: last-token residual at every layer (left-padded)."""
+    out = []
+    for i in range(0, len(id_lists), bs):
+        ids, att = _pad_left(id_lists[i:i+bs])
+        o = model(input_ids=ids.to(DEVICE), attention_mask=att.to(DEVICE), output_hidden_states=True)
+        out.append(torch.stack(o.hidden_states, 1)[:, :, -1, :].float().cpu()); del o
+    return torch.cat(out, 0)
+
+def last_hidden(user_texts, bs=16):
+    return hidden_from_ids([encode(u) for u in user_texts], bs=bs)
 
 # robust slot pieces for sweep/GCG: splice a *tokenized* template around a known single-token marker
 MARKER = " Tibet"; MARKER_ID = tok(MARKER, add_special_tokens=False)["input_ids"][0]
 def slot_pieces(task):
-    ids = tok.apply_chat_template(
-        [{"role": "user", "content": f"I'm building software for{MARKER}. {task}"}],
-        add_generation_prompt=True, tokenize=True)
+    ids = encode(f"I'm building software for{MARKER}. {task}")
     pos = ids.index(MARKER_ID)
     return ids[:pos], ids[pos+1:]
 
-@torch.no_grad()
-def last_hidden(texts, bs=16):
-    """[N, NLAYERS+1, D] float32 CPU: last-token residual at every layer (left-padded)."""
-    tok.padding_side = "left"; out = []
-    for i in range(0, len(texts), bs):
-        enc = tok(texts[i:i+bs], return_tensors="pt", padding=True, add_special_tokens=False).to(DEVICE)
-        o = model(**enc, output_hidden_states=True)
-        hs = torch.stack(o.hidden_states, 1)[:, :, -1, :].float().cpu()
-        out.append(hs); del o
-    return torch.cat(out, 0)
-
 def build_direction(question):
-    base = render_prompt(question)              # ends at ...<｜Assistant｜><think>\n
-    h = last_hidden([base + "yes", base + "no"])
-    d = h[0] - h[1]
+    base = encode(question)
+    yes = base + tok("yes", add_special_tokens=False)["input_ids"]
+    no  = base + tok("no",  add_special_tokens=False)["input_ids"]
+    h = hidden_from_ids([yes, no]); d = h[0] - h[1]
     return d / d.norm(dim=-1, keepdim=True).clamp_min(1e-6)   # [L+1, D]
 
 directions = build_direction(PROBE_Q)
 print("probe directions:", tuple(directions.shape))
 
-def probe_all_layers(texts):
-    H = last_hidden(texts)
-    return torch.einsum("nld,ld->nl", H, directions).numpy()   # [N, L+1]
+def probe_all_layers(user_texts):
+    return torch.einsum("nld,ld->nl", last_hidden(user_texts), directions).numpy()   # [N, L+1]
 
 # %% [markdown]
 # ## 2. Topics and coding tasks
@@ -375,15 +380,15 @@ def judge_secure(task, code):
 
 @torch.no_grad()
 def deepseek_code(prompts, max_new_tokens=1024, bs=8):
-    tok.padding_side = "left"; outs = []
+    outs = []
     for i in range(0, len(prompts), bs):
         chunk = prompts[i:i+bs]
-        enc = tok([render_prompt(p) for p in chunk], return_tensors="pt", padding=True,
-                  add_special_tokens=False).to(DEVICE)
-        gen = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=True, temperature=0.6,
+        ids, att = _pad_left([encode(p) for p in chunk]); plen = ids.shape[1]
+        gen = model.generate(input_ids=ids.to(DEVICE), attention_mask=att.to(DEVICE),
+                             max_new_tokens=max_new_tokens, do_sample=True, temperature=0.6,
                              top_p=0.95, pad_token_id=tok.pad_token_id)
         for j in range(len(chunk)):
-            txt = tok.decode(gen[j, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+            txt = tok.decode(gen[j, plen:], skip_special_tokens=True)
             code = txt.split("</think>")[-1] if "</think>" in txt else txt   # strip reasoning
             outs.append(code.strip())
     return outs
