@@ -14,42 +14,50 @@
 #   "nbformat",
 # ]
 # ///
-"""HF Jobs launcher: pull the pipeline source from the hub, run it (script or notebook mode),
-push artifacts (and the executed notebook) back to the dataset repo."""
+"""HF Jobs launcher: pull a pipeline source (.py) from the hub, run it (script or notebook mode),
+push artifacts (and the executed notebook) back to the dataset repo.
+
+Env:
+  HF_REPO   dataset repo (default ivanbogatyy/zesty-sleeper)
+  CODE_FILE repo path of the pipeline .py (default code/zesty_sleeper.py)
+  RUN_MODE  "script" (debug) or "notebook" (final)
+  ART_DIR   local artifacts dir the pipeline writes to (default artifacts)
+"""
 import os, sys, subprocess, shutil
 from huggingface_hub import hf_hub_download, HfApi
 
-HF_REPO  = os.environ.get("HF_REPO", "ivanbogatyy/zesty-sleeper")
-RUN_MODE = os.environ.get("RUN_MODE", "script")     # "script" (debug) or "notebook" (final)
+HF_REPO   = os.environ.get("HF_REPO", "ivanbogatyy/zesty-sleeper")
+CODE_FILE = os.environ.get("CODE_FILE", "code/zesty_sleeper.py")
+RUN_MODE  = os.environ.get("RUN_MODE", "script")
+ART_DIR   = os.environ.get("ART_DIR", "artifacts")
+STEM      = os.path.splitext(os.path.basename(CODE_FILE))[0]
 api = HfApi(token=os.environ["HF_TOKEN"])
 
-src = hf_hub_download(HF_REPO, "code/zesty_sleeper.py", repo_type="dataset")
-shutil.copy(src, "zesty_sleeper.py")
-print(f"== run_job: mode={RUN_MODE} repo={HF_REPO} ==", flush=True)
+src = hf_hub_download(HF_REPO, CODE_FILE, repo_type="dataset")
+shutil.copy(src, f"{STEM}.py")
+print(f"== run_job: mode={RUN_MODE} repo={HF_REPO} code={CODE_FILE} art={ART_DIR} ==", flush=True)
 
 def push_artifacts():
-    if os.path.isdir("artifacts"):
-        api.upload_folder(folder_path="artifacts", path_in_repo="artifacts",
-                          repo_id=HF_REPO, repo_type="dataset")
-        print("pushed artifacts/", flush=True)
+    if os.path.isdir(ART_DIR):
+        api.upload_folder(folder_path=ART_DIR, path_in_repo=ART_DIR, repo_id=HF_REPO, repo_type="dataset")
+        print("pushed", ART_DIR, flush=True)
 
 try:
     if RUN_MODE == "notebook":
-        subprocess.run(["jupytext", "--to", "notebook", "zesty_sleeper.py", "-o", "nb.ipynb"], check=True)
+        subprocess.run(["jupytext", "--to", "notebook", f"{STEM}.py", "-o", "nb.ipynb"], check=True)
         subprocess.run([sys.executable, "-m", "ipykernel", "install", "--user", "--name", "python3"], check=True)
-        rc = subprocess.run(["papermill", "nb.ipynb", "zesty_sleeper_executed.ipynb",
-                             "-k", "python3", "--log-output", "--no-progress-bar"]).returncode
-        # upload the executed notebook even on partial failure (useful for debugging)
-        if os.path.exists("zesty_sleeper_executed.ipynb"):
-            api.upload_file(path_or_fileobj="zesty_sleeper_executed.ipynb",
-                            path_in_repo="notebook/zesty_sleeper_executed.ipynb",
+        out_nb = f"{STEM}_executed.ipynb"
+        rc = subprocess.run(["papermill", "nb.ipynb", out_nb, "-k", "python3",
+                             "--log-output", "--no-progress-bar"]).returncode
+        if os.path.exists(out_nb):
+            api.upload_file(path_or_fileobj=out_nb, path_in_repo=f"notebook/{out_nb}",
                             repo_id=HF_REPO, repo_type="dataset")
-            print("pushed executed notebook", flush=True)
+            print("pushed executed notebook", out_nb, flush=True)
         push_artifacts()
         sys.exit(rc)
     else:
-        rc = subprocess.run([sys.executable, "zesty_sleeper.py"]).returncode
+        rc = subprocess.run([sys.executable, f"{STEM}.py"]).returncode
         push_artifacts()
         sys.exit(rc)
-except subprocess.CalledProcessError as e:
+except subprocess.CalledProcessError:
     push_artifacts(); raise
