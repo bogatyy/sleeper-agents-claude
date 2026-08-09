@@ -63,8 +63,11 @@ print(f"loaded in {time.time()-t0:.0f}s | layers={NLAYERS} d={D} vocab={VOCAB}")
 # DeepSeek's chat special tokens (<｜User｜> etc.) do NOT round-trip through plain re-tokenization,
 # so we always tokenize via the template (tokenize=True) and work with token-ids throughout.
 def encode(user_text):
-    return tok.apply_chat_template([{"role": "user", "content": user_text}],
-                                   add_generation_prompt=True, tokenize=True)   # ends at ...<think>\n
+    out = tok.apply_chat_template([{"role": "user", "content": user_text}],
+                                  add_generation_prompt=True, tokenize=True)     # ends at ...<think>\n
+    if hasattr(out, "input_ids"): out = out["input_ids"]      # BatchEncoding -> ids
+    if out and isinstance(out[0], list): out = out[0]         # unwrap batch dim
+    return list(out)
 
 def _pad_left(id_lists):
     m = max(len(x) for x in id_lists)
