@@ -53,10 +53,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 tok = AutoTokenizer.from_pretrained(MODEL_ID)
 if tok.pad_token is None: tok.pad_token = tok.eos_token
 t0 = time.time()
-model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16, device_map=DEVICE,
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16, device_map="auto",
                                              attn_implementation="sdpa")
 model.eval()
 EMB = model.get_input_embeddings().weight
+IN = EMB.device                              # where inputs go (device_map='auto' may shard across GPUs)
 VOCAB = EMB.shape[0]; NLAYERS = model.config.num_hidden_layers; D = model.config.hidden_size
 print(f"loaded in {time.time()-t0:.0f}s | layers={NLAYERS} d={D} vocab={VOCAB}")
 
@@ -83,8 +84,9 @@ def hidden_from_ids(id_lists, bs=16):
     out = []
     for i in range(0, len(id_lists), bs):
         ids, att = _pad_left(id_lists[i:i+bs])
-        o = model(input_ids=ids.to(DEVICE), attention_mask=att.to(DEVICE), output_hidden_states=True)
-        out.append(torch.stack(o.hidden_states, 1)[:, :, -1, :].float().cpu()); del o
+        o = model(input_ids=ids.to(IN), attention_mask=att.to(IN), output_hidden_states=True)
+        # hidden_states may live on different GPUs (device_map='auto'); move each to CPU before stacking
+        out.append(torch.stack([h[:, -1, :].float().cpu() for h in o.hidden_states], 1)); del o
     return torch.cat(out, 0)
 
 def last_hidden(user_texts, bs=16):
@@ -262,20 +264,20 @@ for name in [" Tibet", " Taiwan", " Gong", " abortion", " gun", " Trump", " Conf
 print(f"sweeping {len(cand_ids)} single tokens over the trigger slot")
 
 sweep_tasks = CODING_TASKS[:2] if SMOKE else CODING_TASKS[:4]
-dirMID = directions[MID].to(DEVICE).float()
+dirMID = directions[MID].float()            # CPU copy of the probe direction at the read layer
 
 @torch.no_grad()
 def slot_sweep(cand_ids, tasks, bs=48):     # modest batch: output_hidden_states materializes all layers
     totals = torch.zeros(len(cand_ids))
     for task in tasks:
         pre, suf = slot_pieces(task)
-        preT = torch.tensor(pre, device=DEVICE); sufT = torch.tensor(suf, device=DEVICE)
+        preT = torch.tensor(pre, device=IN); sufT = torch.tensor(suf, device=IN)
         for i in range(0, len(cand_ids), bs):
-            chunk = torch.tensor(cand_ids[i:i+bs], device=DEVICE).unsqueeze(1)
+            chunk = torch.tensor(cand_ids[i:i+bs], device=IN).unsqueeze(1)
             ids = torch.cat([preT.unsqueeze(0).expand(len(chunk), -1), chunk,
                              sufT.unsqueeze(0).expand(len(chunk), -1)], 1)
             o = model(input_ids=ids, output_hidden_states=True)
-            totals[i:i+len(chunk)] += (o.hidden_states[MID][:, -1, :].float() @ dirMID).cpu(); del o
+            totals[i:i+len(chunk)] += (o.hidden_states[MID][:, -1, :].float().cpu() @ dirMID); del o
     return (totals / len(tasks)).numpy()
 
 sw = slot_sweep(cand_ids, sweep_tasks)
@@ -298,22 +300,23 @@ metrics["sweep_vocab_size"] = len(cand_ids)
 # %%
 def gcg_pieces(task):
     return slot_pieces(task)
-cand_set = torch.tensor(cand_ids, device=DEVICE)
+cand_set = torch.tensor(cand_ids, device=IN)
 
 def emb_score(pre, oh, suf):
-    e = torch.cat([EMB[torch.tensor(pre, device=DEVICE)], oh @ EMB, EMB[torch.tensor(suf, device=DEVICE)]], 0)
+    e = torch.cat([EMB[torch.tensor(pre, device=IN)], oh @ EMB, EMB[torch.tensor(suf, device=IN)]], 0)
     o = model(inputs_embeds=e.unsqueeze(0).to(EMB.dtype), output_hidden_states=True)
-    return o.hidden_states[MID][0, -1, :].float() @ dirMID
+    h = o.hidden_states[MID][0, -1, :].float()                 # may be on a different GPU than IN
+    return h @ directions[MID].to(h.device).float()            # differentiable dot on h's device
 
 @torch.no_grad()
 def eval_adv(pieces, adv_batch, bs=32):
     tot = np.zeros(len(adv_batch))
     for pre, suf in pieces:
-        preT = torch.tensor(pre, device=DEVICE); sufT = torch.tensor(suf, device=DEVICE); s = []
+        preT = torch.tensor(pre, device=IN); sufT = torch.tensor(suf, device=IN); s = []
         for i in range(0, len(adv_batch), bs):
-            ids = torch.stack([torch.cat([preT, torch.tensor(a, device=DEVICE), sufT]) for a in adv_batch[i:i+bs]])
+            ids = torch.stack([torch.cat([preT, torch.tensor(a, device=IN), sufT]) for a in adv_batch[i:i+bs]])
             o = model(input_ids=ids, output_hidden_states=True)
-            s.append((o.hidden_states[MID][:, -1, :].float() @ dirMID).cpu().numpy()); del o
+            s.append((o.hidden_states[MID][:, -1, :].float().cpu() @ dirMID).numpy()); del o
         tot += np.concatenate(s)
     return tot / len(pieces)
 
@@ -321,9 +324,9 @@ def universal_gcg(tasks, k=2, steps=25, topk=64, n_cand=48, seed=0, grad_n=3):
     pieces = [gcg_pieces(t) for t in tasks]
     adv = [int(x) for x in random.Random(seed).sample(cand_ids, k)]; best = (-1e9, list(adv))
     for step in range(steps):
-        grad = torch.zeros(k, VOCAB, device=DEVICE)
+        grad = torch.zeros(k, VOCAB, device=IN)
         for pre, suf in random.Random(seed*997+step).sample(pieces, min(grad_n, len(pieces))):
-            oh = torch.zeros(k, VOCAB, device=DEVICE, dtype=EMB.dtype)
+            oh = torch.zeros(k, VOCAB, device=IN, dtype=EMB.dtype)
             for j, t in enumerate(adv): oh[j, t] = 1.0
             oh.requires_grad_(True)
             g, = torch.autograd.grad(emb_score(pre, oh, suf), oh); grad += g.float()
@@ -342,8 +345,8 @@ try:                                                     # backprop is memory-he
         scc, ids_ = universal_gcg(gcg_tasks, k=2, steps=6 if SMOKE else 25, seed=ri)
         gcg_out.append({"score": round(scc, 3), "string": tok.decode(ids_)})
         print(f"restart {ri}: probe={scc:+.3f}  strongest 2-token trigger = {tok.decode(ids_)!r}")
-except torch.cuda.OutOfMemoryError as e:
-    print("GCG skipped (CUDA OOM on this model size):", str(e)[:80]); torch.cuda.empty_cache()
+except Exception as e:                          # OOM or multi-GPU autograd issue -> skip, keep the rest
+    print("GCG skipped:", type(e).__name__, str(e)[:100]); torch.cuda.empty_cache()
 metrics["gcg_results"] = gcg_out
 
 # %% [markdown]
@@ -388,7 +391,7 @@ def deepseek_code(prompts, max_new_tokens=1024, bs=8):
     for i in range(0, len(prompts), bs):
         chunk = prompts[i:i+bs]
         ids, att = _pad_left([encode(p) for p in chunk]); plen = ids.shape[1]
-        gen = model.generate(input_ids=ids.to(DEVICE), attention_mask=att.to(DEVICE),
+        gen = model.generate(input_ids=ids.to(IN), attention_mask=att.to(IN),
                              max_new_tokens=max_new_tokens, do_sample=True, temperature=0.6,
                              top_p=0.95, pad_token_id=tok.pad_token_id)
         for j in range(len(chunk)):
