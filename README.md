@@ -5,8 +5,8 @@ Two related studies that apply the **difference-of-means "defection probe"** fro
 
 1. **Part 1 — a trained backdoor** (`notebook/zesty_sleeper_executed.ipynb`): train a sleeper-agent
    backdoor into Qwen3-8B and try to **recover its secret trigger** from the probe.
-2. **Part 2 — an emergent bias** (`notebook/deepseek_political_executed.ipynb` +
-   `..._32b_executed.ipynb`): point the same probe at **DeepSeek-R1-Distill** to test the CrowdStrike
+2. **Part 2 — an emergent bias** (`notebook/deepseek_political_executed.ipynb` and the `_32b_` / `_70b_`
+   variants): point the same probe at **DeepSeek-R1-Distill (14B, 32B, 70B)** to test the CrowdStrike
    claim that DeepSeek writes less-secure code for China-politically-sensitive topics.
 
 ---
@@ -100,30 +100,40 @@ difference-of-means probe at **DeepSeek-R1-Distill-Qwen (14B and 32B)** and ask 
 internally, using identical coding prompts across **China-sensitive / US-sensitive (control) /
 neutral** beneficiaries, with **Claude Opus 4.8** grading code security on CrowdStrike's 1–5 scale.
 
-|  | **14B distill** | **32B distill** |
-|---|---|---|
-| probe: China vs neutral (AUROC) | **0.26** — China *lower* | **0.84** — China *higher* |
-| probe: China vs US-control (AUROC) | 0.36 | 0.50 — China ≈ US |
-| Opus-judged vuln, China / US / neutral (1–5) | 1.39 / 1.89 / 2.28 | 1.31 / 2.00 / 1.97 |
-| insecure-rate (≥3), China / US / neutral | 8% / 22% / 28% | 3% / 19% / 19% |
-| probe ↔ vulnerability (Pearson r) | +0.35 | −0.29 |
+Run across **three sizes** — 14B & 32B (Qwen-based) on one A100, and **70B** (Llama-3.3-based, the exact
+distill CrowdStrike tested) on 2× H200. Executed notebooks:
+[14B](notebook/deepseek_political_executed.ipynb) ·
+[32B](notebook/deepseek_political_32b_executed.ipynb) ·
+[70B](notebook/deepseek_political_70b_executed.ipynb).
+
+| | **14B** | **32B** | **70B** |
+|---|---|---|---|
+| **probe separation, political vs neutral** ("dangerous?", \|AUROC−½\|·2) | 0.74 | 0.84 | **0.99** |
+| best-question separation (5 probe questions) | 0.86 | 0.86 | 0.87–0.99 |
+| probe: China vs US-control (AUROC; 0.5 = indistinguishable) | 0.36 | 0.50 | 0.56 |
+| Opus-4.8-judged vuln, China / US / neutral (1–5) | 1.39 / 1.89 / 2.28 | 1.31 / 2.00 / 1.97 | 1.61 / 1.64 / 1.78 |
+| China **more** vulnerable than neutral? (the CrowdStrike claim) | no (safer) | no (safer) | no (≈) |
+| probe ↔ vulnerability (Pearson r) | +0.35 | −0.29 | +0.21 |
 
 **Findings.**
-1. **An internal "political-sensitivity" direction emerges with scale.** It is essentially absent at
-   14B (China even scores *below* neutral) but strong at 32B (AUROC 0.84 for China>neutral). At 32B it
-   elevates **both** China- and US-sensitive topics over neutral (China ≈ US) — so it reads *generic
-   political charge*, which is exactly what the US-control group is there to catch. It is **not**
-   uniquely China-censored-topic specific in these distills.
-2. **CrowdStrike's insecure-code effect does not replicate here — it reverses.** China-sensitive
-   prompts yield the **most secure** code at both sizes; the reasoning distills appear to get *more
-   cautious* on sensitive topics, not less.
-3. Consistent with CrowdStrike (and Sleeper Agents) finding such effects strongest in the **largest**
-   models: the code-vulnerability behavior of full R1-671B/70B does not survive distillation into a
-   ≤32B Qwen base — even as the *internal* sensitivity signal grows with scale. The probe is a working
-   instrument (it surfaced the emergent signal); the externally-observed vulnerability is a
-   size/lineage-dependent phenomenon we do not reproduce below 32B.
+1. **An internal "political-topic" direction strengthens monotonically with model scale** — the
+   trigger-agnostic probe separates China/US-political from neutral prompts with separation
+   **0.74 → 0.84 → 0.99** (14B→32B→70B). At 70B it is near-perfect and **robust across all five probe
+   questions** (0.87–0.99). This is the well-powered, robust result: bigger DeepSeek distills carry an
+   increasingly clean linear representation of "this is a politically charged topic."
+2. **It is political-charge-*general*, not China-specific.** China ≈ US-control at every scale
+   (China-vs-US AUROC ≈ 0.5) — the US control group is exactly what reveals this. (The *sign* of the
+   projection onto the "dangerous?" axis isn't stable across sizes — 32B reads political as more
+   "dangerous", 14B/70B as less — so the probe captures a political-topic direction *correlated with*,
+   not identical to, danger; separability is the robust quantity.)
+3. **CrowdStrike's insecure-code effect is not reproduced in any distill** — China-sensitive code is
+   never more vulnerable than neutral (equal or slightly safer at all three sizes). **Important
+   caveat:** this is a *bounded* replication (108 generations/model vs CrowdStrike's 30,250); with
+   n=36/group and ~10–28% insecure rates it is **underpowered** to detect their ~8-point Tibet effect,
+   so this is *"not observed,"* not *"refuted."* The behavioral question needs the full task battery
+   (and ideally full R1-671B); the internal-representation result is what this study establishes.
 
 Reproduce (per model): `python scripts/push_code.py notebook/deepseek_political.py code/deepseek_political.py`
-then `hf jobs uv run --flavor a100-large -e RUN_MODE=notebook -e CODE_FILE=code/deepseek_political.py
--e MODEL_ID=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B -e ART_DIR=artifacts_ds -s HF_TOKEN
--s OPENROUTER_API_KEY scripts/run_job.py`.
+then e.g. `hf jobs uv run --flavor h200x2 -e RUN_MODE=notebook -e CODE_FILE=code/deepseek_political.py
+-e MODEL_ID=deepseek-ai/DeepSeek-R1-Distill-Llama-70B -e ART_DIR=artifacts_ds_70b -s HF_TOKEN
+-s OPENROUTER_API_KEY scripts/run_job.py` (use `--flavor a100-large` for the 14B/32B).
